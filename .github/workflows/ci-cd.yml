@@ -1,0 +1,111 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/vanloukdom/zero-downtime-migration
+  NAMESPACE: p07-migration
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -q
+        env:
+          ADMIN_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          REDIS_URL: redis://localhost:6379/0
+
+  build:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vérifier la présence du kubeconfig
+        id: guard
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          if [ -z "$KUBECONFIG_B64" ]; then
+            echo "Secret KUBECONFIG_B64 absent : déploiement ignoré."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: azure/setup-kubectl@v4
+        if: steps.guard.outputs.enabled == 'true'
+      - name: Déployer sur k3s
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          APP_SECRET: ${{ secrets.APP_SECRET }}
+        run: |
+          echo "$KUBECONFIG_B64" | base64 -d > kubeconfig && chmod 600 kubeconfig
+          export KUBECONFIG=$PWD/kubeconfig
+          kubectl apply -f k8s/namespace.yaml
+          : "${POSTGRES_PASSWORD:?Ajoutez le secret POSTGRES_PASSWORD dans le repo}"
+          : "${APP_SECRET:?Ajoutez le secret APP_SECRET (openssl rand -hex 32)}"
+          kubectl -n "$NAMESPACE" create secret generic app-secrets \
+            --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            --from-literal=APP_SECRET="$APP_SECRET" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          sed -i "s|IMAGE_PLACEHOLDER|$IMAGE:${{ github.sha }}|g" k8s/*.yaml
+          # 1) Base de données d'abord (no-op si déjà en place)
+          kubectl -n "$NAMESPACE" apply -f k8s/postgres.yaml
+          kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=180s
+          # 2) Migration « expand » AVANT le déploiement du nouveau code
+          kubectl -n "$NAMESPACE" delete job migrate --ignore-not-found
+          kubectl -n "$NAMESPACE" apply -f k8s/migrate-job.yaml
+          kubectl -n "$NAMESPACE" wait --for=condition=complete job/migrate --timeout=300s
+          # 3) Rolling update (maxUnavailable: 0) : v1 et v2 cohabitent sans erreur
+          kubectl apply -k k8s/
+          for d in $(kubectl -n "$NAMESPACE" get deploy -o name); do
+            kubectl -n "$NAMESPACE" rollout status "$d" --timeout=180s
+          done

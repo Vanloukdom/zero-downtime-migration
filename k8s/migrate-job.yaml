@@ -1,0 +1,30 @@
+# Appliqué par la CI AVANT le rolling update (voir .github/workflows/ci-cd.yml).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  labels:
+    app.kubernetes.io/component: migration
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: migrate
+          image: IMAGE_PLACEHOLDER
+          command: ["python", "-m", "app.migrate"]
+          env:
+            - name: MIGRATE_TO
+              value: "003"          # passer à "004" (contract) quand plus aucun pod v1 ne tourne
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: POSTGRES_PASSWORD
+            - name: DATABASE_URL
+              value: postgresql://postgres:$(POSTGRES_PASSWORD)@postgres:5432/app
